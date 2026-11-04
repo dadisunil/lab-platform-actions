@@ -1,0 +1,122 @@
+name: ci
+on:
+  workflow_call:
+    inputs:
+      image-name:
+        description: Image and chart name, for example hello
+        type: string
+        required: true
+      policy-repo:
+        description: Repo (owner/name) that holds policies/ci. Empty means the policy step is skipped. Used from Phase 3.
+        type: string
+        required: false
+        default: ""
+    outputs:
+      image-tag:
+        description: Tag of the image that was built
+        value: ${{ jobs.build.outputs.image-tag }}
+      image-digest:
+        description: Digest of the pushed image (empty on pull requests)
+        value: ${{ jobs.build.outputs.image-digest }}
+ 
+permissions:
+  contents: read
+ 
+env:
+  TRIVY_IMAGE: aquasec/trivy:0.76.1
+ 
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Lint YAML
+        run: |
+          python3 -m pip install --quiet yamllint==1.37.1
+          yamllint .
+      - name: Lint Dockerfile
+        uses: hadolint/hadolint-action@v3.5.0
+        with:
+          dockerfile: Dockerfile
+      - uses: azure/setup-helm@v5
+        with:
+          version: v4.3.1
+      - name: Lint charts, check schemas and deprecated APIs
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/bin"
+          curl -fsSL "https://github.com/yannh/kubeconform/releases/download/v0.8.0/kubeconform-linux-amd64.tar.gz" | tar -xz -C "$HOME/bin" kubeconform
+          curl -fsSL "https://github.com/FairwindsOps/pluto/releases/download/v5.24.4/pluto_5.24.4_linux_amd64.tar.gz" | tar -xz -C "$HOME/bin" pluto
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          helm lint charts/*
+          for chart in charts/*; do
+            helm template "$chart" | "$HOME/bin/kubeconform" -strict -summary
+          done
+          "$HOME/bin/pluto" detect-files -d deploy -t k8s=v1.35.0
+      - name: Scan configuration for misconfigurations (Trivy)
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src "$TRIVY_IMAGE" config \
+            --severity HIGH,CRITICAL --exit-code 1 .
+      # Dormant until Phase 3: runs only when the caller passes policy-repo
+      - name: Policy check with the Kyverno CLI (same rules the cluster enforces)
+        if: inputs.policy-repo != ''
+        env:
+          POLICY_REPO: ${{ inputs.policy-repo }}
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://github.com/kyverno/kyverno/releases/download/v1.19.2/kyverno-cli_v1.19.2_linux_x86_64.tar.gz" | tar -xz -C "$HOME/bin" kyverno
+          git clone --depth 1 "https://github.com/${POLICY_REPO}.git" "$RUNNER_TEMP/policies"
+          kubectl kustomize "$RUNNER_TEMP/policies/policies/ci" > "$RUNNER_TEMP/ci-policies.yaml"
+          for chart in charts/*; do helm template "$chart"; echo '---'; done > "$RUNNER_TEMP/rendered.yaml"
+          kyverno apply "$RUNNER_TEMP/ci-policies.yaml" --resource "$RUNNER_TEMP/rendered.yaml"
+ 
+  build:
+    needs: validate
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tag }}
+      image-digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Compute image name and tag
+        id: meta
+        env:
+          OWNER: ${{ github.repository_owner }}
+          NAME: ${{ inputs.image-name }}
+        run: |
+          owner="${OWNER,,}"
+          echo "tag=sha-${GITHUB_SHA::8}" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/${owner}/${NAME}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v4
+      - name: Build (kept local, not pushed yet)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          tags: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+      - name: Scan the built image (fail on HIGH or CRITICAL)
+        env:
+          IMAGE_REF: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock "$TRIVY_IMAGE" image \
+            --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 "$IMAGE_REF"
+      - name: Log in to the registry
+        if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Push the image (only after the scans passed)
+        id: push
+        if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+          sbom: true
+          provenance: mode=max

@@ -1,0 +1,83 @@
+name: cd
+on:
+  workflow_call:
+    inputs:
+      image-name:
+        type: string
+        required: true
+      image-tag:
+        type: string
+        required: true
+      image-digest:
+        type: string
+        required: true
+ 
+permissions:
+  contents: read 
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: azure/setup-helm@v5
+        with:
+          version: v4.3.1
+      - uses: sigstore/cosign-installer@v4.1.2
+      - name: Log in to the registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Package and push the chart (OCI)
+        id: chart
+        env:
+          OWNER: ${{ github.repository_owner }}
+          NAME: ${{ inputs.image-name }}
+          IMAGE_TAG: ${{ inputs.image-tag }}
+        run: |
+          set -euo pipefail
+          owner="${OWNER,,}"
+          version="0.1.0-v${GITHUB_SHA::8}"
+          helm package "charts/${NAME}" --version "${version}" --app-version "${IMAGE_TAG}" --destination dist
+          helm push "dist/${NAME}-${version}.tgz" "oci://ghcr.io/${owner}/charts"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+      - name: Sign the image (by digest, with context annotations)
+        env:
+          OWNER: ${{ github.repository_owner }}
+          NAME: ${{ inputs.image-name }}
+          DIGEST: ${{ inputs.image-digest }}
+        run: |
+          owner="${OWNER,,}"
+          cosign sign --yes \
+            -a "repo=${GITHUB_REPOSITORY}" -a "workflow=${GITHUB_WORKFLOW}" -a "sha=${GITHUB_SHA}" \
+            "ghcr.io/${owner}/${NAME}@${DIGEST}"
+      - name: Write the new versions into the release manifest
+        env:
+          CHART_VERSION: ${{ steps.chart.outputs.version }}
+          IMAGE_TAG: ${{ inputs.image-tag }}
+        run: |
+          yq -i '.spec.chart.spec.version = strenv(CHART_VERSION) | .spec.values.image.tag = strenv(IMAGE_TAG)' deploy/base/release.yaml
+      - name: Commit and push (marked so the pipeline does not re-trigger itself)
+        env:
+          NAME: ${{ inputs.image-name }}
+          CHART_VERSION: ${{ steps.chart.outputs.version }}
+          IMAGE_TAG: ${{ inputs.image-tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add deploy/base/release.yaml
+          git diff --cached --quiet && { echo "no change to commit"; exit 0; }
+          git commit -m "[github-ci] ${NAME} incremented to chart=${CHART_VERSION} image=${IMAGE_TAG}"
+          git pull --rebase
+          git push
+      - name: Deployment summary
+        env:
+          CHART_VERSION: ${{ steps.chart.outputs.version }}
+          IMAGE_TAG: ${{ inputs.image-tag }}
+        run: |
+          echo "Released chart ${CHART_VERSION} with image ${IMAGE_TAG}. Flux will roll it out." >> "$GITHUB_STEP_SUMMARY"
